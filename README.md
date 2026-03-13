@@ -1,3 +1,5 @@
+> 该Fork合并了来自https://github.com/Diorser/LiteMonitor/issues/285 的PR，可以手动指定传感器 ID 。
+
 [English](./README.en.md)
 
 # <img src="./resources/screenshots/logo.png"  width="28" style="vertical-align: middle; margin-top: -4px;" /> LiteMonitor
