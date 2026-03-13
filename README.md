@@ -1,4 +1,5 @@
 > 该Fork合并了来自https://github.com/Diorser/LiteMonitor/issues/285 的PR，可以手动指定传感器 ID 。
+> 使用GitHub Actions自动构建。
 
 [English](./README.en.md)
 
