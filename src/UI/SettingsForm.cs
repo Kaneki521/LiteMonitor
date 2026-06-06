@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.IO;
 using System.Windows.Forms;
 using LiteMonitor.src.Core;
 using LiteMonitor.src.Core.Actions;
@@ -116,8 +115,7 @@ namespace LiteMonitor.src.UI
                     try 
                     {
                         Settings.GlobalBlockSave = true;
-                        var path = Path.Combine(AppContext.BaseDirectory, "settings.json");
-                        if (File.Exists(path)) File.Delete(path);
+                        SettingsHelper.DeleteStoredSettings();
                         Application.Restart();
                         Environment.Exit(0);
                     }
@@ -210,6 +208,8 @@ namespace LiteMonitor.src.UI
 
         private void ApplySettings()
         {
+            bool oldAutoStart = _cfg.AutoStart;
+
             // 保存逻辑顺序优化
             foreach (var kv in _pages) 
             {
@@ -237,12 +237,13 @@ namespace LiteMonitor.src.UI
 
             // 2. 合并变更到 Live Settings
             SettingsChanger.Merge(_cfg, _draftCfg);
+            bool autoStartChanged = oldAutoStart != _cfg.AutoStart;
 
             // 3. 持久化保存
             _cfg.Save();
             
             // 4. 应用副作用 (刷新界面)
-            AppActions.ApplyAllSettings(_cfg, _mainForm, _ui);
+            AppActions.ApplyAllSettings(_cfg, _mainForm, _ui, autoStartChanged);
 
             // 5. [Fix] Rebase Draft to match Live
             // 将 Live 环境中由插件生成的最新监控项同步回 Draft，并保留动态显示属性

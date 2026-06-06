@@ -29,6 +29,9 @@ namespace LiteMonitor.src.SystemServices
         // 对象级缓存：(Sensor对象)
         private Dictionary<string, ISensor> _manualSensorCache = new();
 
+        private const float AutoMoboTempHardMax = 95f;
+        private const float ManualMoboTempHardMax = 125f;
+
         // 配置版本追踪，用于自动触发预热
         private string _lastPrefCpuFan = "";
         private string _lastPrefCpuPump = "";
@@ -36,6 +39,7 @@ namespace LiteMonitor.src.SystemServices
         private string _lastPrefMoboTemp = "";
         private string _lastPrefDisk = "";
         private string _lastPrefNet = "";
+        private string _lastPrefGpu = "";
         
         public HardwareValueProvider(Computer c, Settings s, SensorMap map, NetworkManager net, DiskManager disk, FpsCounter fpsCounter,PerformanceCounterManager perfManager, object syncLock, Dictionary<string, float> lastValid)
         {
@@ -65,6 +69,7 @@ namespace LiteMonitor.src.SystemServices
             _lastPrefMoboTemp = _cfg.PreferredMoboTemp;
             _lastPrefDisk = _cfg.PreferredDisk;
             _lastPrefNet = _cfg.PreferredNetwork;
+            _lastPrefGpu = _cfg.PreferredGpu ?? "";
 
             // 1. 预查找用户指定的首选传感器 (风扇、水泵、主板温度)
             string[] preferredKeys = { "CPU.Fan", "CPU.Pump", "CASE.Fan", "MOBO.Temp" };
@@ -188,8 +193,15 @@ namespace LiteMonitor.src.SystemServices
             {
                 _tickCache.Clear();
 
-                // 自动检测配置变更：如果用户更改了首选风扇/磁盘，立即自动预热
-                if (_lastPrefCpuFan != _cfg.PreferredCpuFan ||
+                bool gpuChanged = _lastPrefGpu != (_cfg.PreferredGpu ?? "");
+                if (gpuChanged)
+                {
+                    _sensorMap.Rebuild(_computer, _cfg);
+                }
+
+                // 自动检测配置变更：如果用户更改了首选风扇/磁盘/显卡，立即自动预热
+                if (gpuChanged ||
+                    _lastPrefCpuFan != _cfg.PreferredCpuFan ||
                     _lastPrefCpuPump != _cfg.PreferredCpuPump ||
                     _lastPrefCaseFan != _cfg.PreferredCaseFan ||
                     _lastPrefMoboTemp != _cfg.PreferredMoboTemp ||
@@ -205,6 +217,45 @@ namespace LiteMonitor.src.SystemServices
         // ===========================================================
         // ===================== 公共取值入口 =========================
         // ===========================================================
+        public float? GetStartupValue(string key)
+        {
+            if (_lastValidMap.TryGetValue(key, out float lastVal)) return lastVal;
+
+            bool useCounter = _cfg.UseWinPerCounters && _perfManager.IsInitialized;
+            if (!useCounter) return null;
+
+            if (key == "CPU.Load")
+            {
+                var cpuLoad = _perfManager.GetCpuLoad();
+                return cpuLoad.HasValue ? Math.Clamp(cpuLoad.Value, 0f, 100f) : null;
+            }
+
+            if (key == "CPU.Clock")
+            {
+                return _perfManager.GetCpuFreq();
+            }
+
+            if (key == "MEM.Load")
+            {
+                var memData = _perfManager.GetMemoryData();
+                if (memData.Load.HasValue && Settings.DetectedRamTotalGB <= 0 && _perfManager.TotalMemoryGB > 0.1f)
+                {
+                    Settings.DetectedRamTotalGB = _perfManager.TotalMemoryGB;
+                }
+                return memData.Load;
+            }
+
+            if (key == "DISK.Read") return _perfManager.GetDiskRead();
+            if (key == "DISK.Write") return _perfManager.GetDiskWrite();
+            if (key == "DISK.Activity")
+            {
+                var diskActive = _perfManager.GetDiskActive();
+                return diskActive.HasValue ? Math.Clamp(diskActive.Value, 0f, 100f) : null;
+            }
+
+            return null;
+        }
+
         public float? GetValue(string key)
         {
             // ★★★ [优化] 使用 TryEnter 避免 UI 线程因后台重载而卡死 ★★★
@@ -230,6 +281,7 @@ namespace LiteMonitor.src.SystemServices
 
                 // 定义临时结果变量
                 float? result = null;
+                bool skipGenericFallback = false;
                 
                 // ★★★ [核心逻辑] 全局开关判断：只有当开关开启，且管理器已初始化成功时，才尝试走计数器 ★★★
                 // 这里的 UseWindowsPerformanceCounters 对应 Step 1 中 Settings 新增的属性
@@ -373,9 +425,10 @@ namespace LiteMonitor.src.SystemServices
 
                     // 主板温度
                     case "MOBO.Temp":
+                        skipGenericFallback = true;
                         if (_manualSensorCache.TryGetValue(key, out var sMobo))
                         {
-                            result = sMobo.Value;
+                            result = ReadMoboTemperature(sMobo);
                         }
                         break;
 
@@ -446,7 +499,7 @@ namespace LiteMonitor.src.SystemServices
 
                 // 10. 通用传感器查找 (兜底)
                 // ★★★ [优化] 移除锁和 _sensorMap 查找，直接查静态缓存 ★★★
-                if (result == null && _manualSensorCache.TryGetValue(key, out var sGen))
+                if (!skipGenericFallback && result == null && _manualSensorCache.TryGetValue(key, out var sGen))
                 {
                     var val = sGen.Value;
                     if (val.HasValue && !float.IsNaN(val.Value)) 
@@ -473,6 +526,44 @@ namespace LiteMonitor.src.SystemServices
             {
                 if (lockTaken) Monitor.Exit(_lock);
             }
+        }
+
+        private float? ReadMoboTemperature(ISensor sensor)
+        {
+            bool manualSensor = IsManualMoboTemperatureSelected();
+            var raw = sensor.Value;
+            if (!raw.HasValue || float.IsNaN(raw.Value) || float.IsInfinity(raw.Value) || raw.Value <= 0f)
+            {
+                return GetLastValidMoboTemperature(manualSensor);
+            }
+
+            float value = raw.Value;
+            bool overHardMax = manualSensor ? value > ManualMoboTempHardMax : value >= AutoMoboTempHardMax;
+            if (overHardMax)
+            {
+                return GetLastValidMoboTemperature(manualSensor);
+            }
+
+            _lastValidMap["MOBO.Temp"] = value;
+            return value;
+        }
+
+        private bool IsManualMoboTemperatureSelected()
+        {
+            string pref = _cfg.PreferredMoboTemp ?? "";
+            return !string.IsNullOrWhiteSpace(pref) &&
+                   !pref.Contains("自动", StringComparison.OrdinalIgnoreCase) &&
+                   !pref.Contains("Auto", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private float? GetLastValidMoboTemperature(bool manualSensor)
+        {
+            float max = manualSensor ? ManualMoboTempHardMax : AutoMoboTempHardMax;
+            return _lastValidMap.TryGetValue("MOBO.Temp", out float last) &&
+                   last > 0f &&
+                   last <= max
+                ? last
+                : null;
         }
 
         public void Dispose()
